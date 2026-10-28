@@ -1,7 +1,7 @@
 /*
- * Macrotec Font: Outlook function command.
+ * Email Composer: Outlook function command.
  *
- * Runs when the "Macrotec Font" button is clicked in a compose window.
+ * Runs when the "Email Composer" button is clicked in a compose window.
  * Reads the draft body, applies Century Gothic 10pt to the new text via
  * MacrotecFont.applyHouseFont, and writes it back. Touches only the item
  * being composed (ReadWriteItem permission). Makes no network requests.
@@ -39,7 +39,7 @@
     item.body.getAsync(Office.CoercionType.Html, function (read) {
       if (read.status !== Office.AsyncResultStatus.Succeeded) {
         notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-          "Macrotec Font: could not read the email body.");
+          "Email Composer: could not read the email body.");
         done();
         return;
       }
@@ -49,7 +49,7 @@
         result = MacrotecFont.applyHouseFont(read.value, parse);
       } catch (e) {
         notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-          "Macrotec Font: formatting failed (" + e.message + ").");
+          "Email Composer: formatting failed (" + e.message + ").");
         done();
         return;
       }
@@ -57,7 +57,7 @@
       item.body.setAsync(result.html, { coercionType: Office.CoercionType.Html }, function (write) {
         if (write.status !== Office.AsyncResultStatus.Succeeded) {
           notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-            "Macrotec Font: could not update the email body.");
+            "Email Composer: could not update the email body.");
         } else {
           notify(item, Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
             "Century Gothic 10 applied.");
