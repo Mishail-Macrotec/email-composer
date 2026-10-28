@@ -1,28 +1,33 @@
 /*
- * Email Composer: Outlook function command.
+ * Email Composer: DIAGNOSTIC function command.
  *
- * Runs when the "Email Composer" button is clicked in a compose window.
- * Reads the draft body, applies Century Gothic 10pt to the new text via
- * MacrotecFont.applyHouseFont, and writes it back. Touches only the item
- * being composed (ReadWriteItem permission). Makes no network requests.
+ * Same job as the normal commands.js, but reports each step in the bar at the
+ * top of the draft ("Email Composer step N: ...") and always tells Outlook it
+ * has finished, so the button cannot spin forever. The last step shown is
+ * where it stopped. Do not leave this version live.
  */
 /* global Office, MacrotecFont */
 (function () {
   "use strict";
 
-  var NOTICE_KEY = "macrotecFont";
+  var NOTICE_KEY = "emailComposerDiag";
+  var loadedAt = Date.now();
+  var officeReady = false;
 
-  function notify(item, type, message) {
-    // Shows a short line at the top of the draft; failure here is harmless.
+  function log(msg) {
+    try { console.log("[Email Composer] " + msg); } catch (e) { /* ignore */ }
+  }
+
+  function show(item, isError, message) {
+    log(message);
     try {
-      item.notificationMessages.replaceAsync(NOTICE_KEY, {
-        type: type,
-        message: message,
-        icon: "Icon.16x16",
-        persistent: false,
-      });
+      item.notificationMessages.replaceAsync(NOTICE_KEY, isError
+        ? { type: Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage, message: message }
+        : { type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
+            message: message, icon: "Icon.16x16", persistent: true },
+        function (r) { if (r.status !== "succeeded") log("notification failed: " + JSON.stringify(r.error)); });
     } catch (e) {
-      /* notifications are cosmetic */
+      log("notification threw: " + e.message);
     }
   }
 
@@ -31,48 +36,75 @@
   }
 
   function applyHouseFont(event) {
-    var item = Office.context.mailbox.item;
+    var finished = false;
+    var step = "0 started";
     var done = function () {
-      if (event && typeof event.completed === "function") event.completed();
+      if (finished) return;
+      finished = true;
+      try { if (event && typeof event.completed === "function") event.completed(); }
+      catch (e) { log("completed() threw: " + e.message); }
     };
+    log("clicked; officeReady=" + officeReady + ", loaded " + (Date.now() - loadedAt) + " ms ago");
 
-    item.body.getAsync(Office.CoercionType.Html, function (read) {
-      if (read.status !== Office.AsyncResultStatus.Succeeded) {
-        notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-          "Email Composer: could not read the email body.");
+    var item;
+    try {
+      item = Office.context.mailbox.item;
+    } catch (e) {
+      log("step 1 failed, no mailbox item: " + e.message);
+      done();
+      return;
+    }
+
+    // Safety net: never leave the button spinning.
+    setTimeout(function () {
+      if (!finished) {
+        show(item, true, "Email Composer: stopped at step " + step + " (timed out after 10 s).");
         done();
-        return;
       }
+    }, 10000);
 
-      var result;
-      try {
-        result = MacrotecFont.applyHouseFont(read.value, parse);
-      } catch (e) {
-        notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-          "Email Composer: formatting failed (" + e.message + ").");
-        done();
-        return;
-      }
-
-      item.body.setAsync(result.html, { coercionType: Office.CoercionType.Html }, function (write) {
-        if (write.status !== Office.AsyncResultStatus.Succeeded) {
-          notify(item, Office.MailboxEnums.ItemNotificationMessageType.ErrorMessage,
-            "Email Composer: could not update the email body.");
-        } else {
-          notify(item, Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
-            "Century Gothic 10 applied.");
+    try {
+      step = "2 reading body";
+      show(item, false, "Email Composer step 2: reading the body (Office ready: " + officeReady + ").");
+      item.body.getAsync(Office.CoercionType.Html, function (read) {
+        try {
+          if (read.status !== Office.AsyncResultStatus.Succeeded) {
+            show(item, true, "Email Composer step 2 failed: " + JSON.stringify(read.error));
+            done();
+            return;
+          }
+          step = "3 formatting";
+          var result = MacrotecFont.applyHouseFont(read.value, parse);
+          step = "4 writing body";
+          show(item, false, "Email Composer step 4: read " + read.value.length +
+            " chars, changed " + result.changed + ", writing back.");
+          item.body.setAsync(result.html, { coercionType: Office.CoercionType.Html }, function (write) {
+            if (write.status !== Office.AsyncResultStatus.Succeeded) {
+              show(item, true, "Email Composer step 4 failed: " + JSON.stringify(write.error));
+            } else {
+              show(item, false, "Email Composer step 5: done. Century Gothic 10 applied.");
+            }
+            done();
+          });
+        } catch (e) {
+          show(item, true, "Email Composer failed at step " + step + ": " + e.message);
+          done();
         }
-        done();
       });
-    });
+    } catch (e) {
+      show(item, true, "Email Composer failed at step " + step + ": " + e.message);
+      done();
+    }
   }
 
-  // Older clients look the function up by its global name; newer ones use
-  // Office.actions.associate. Support both.
+  window.addEventListener("error", function (e) { log("page error: " + e.message); });
   window.applyHouseFont = applyHouseFont;
-  Office.onReady(function () {
+  Office.onReady(function (info) {
+    officeReady = true;
+    log("Office ready: host=" + (info && info.host) + ", platform=" + (info && info.platform));
     if (Office.actions && typeof Office.actions.associate === "function") {
       Office.actions.associate("applyHouseFont", applyHouseFont);
     }
   });
+  log("commands.js loaded");
 })();
