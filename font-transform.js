@@ -69,16 +69,7 @@
     }
   }
 
-  function isBlankLine(el) {
-    if (!el || el.tagName !== "DIV") return false;
-    var text = (el.textContent || "").replace(/ /g, "").trim();
-    if (text !== "") return false;
-    // A blank line is a div holding nothing but an optional <br>.
-    var children = el.children;
-    return children.length === 0 || (children.length === 1 && children[0].tagName === "BR");
-  }
-
-  // Looser test used for the sign-off gap: an empty div or paragraph in any
+  // A blank line: an empty div or paragraph in any
   // form Outlook writes it (<br>, &nbsp;, an empty span), with no images,
   // tables, rules or lists inside.
   function isEmptyLine(el) {
@@ -153,21 +144,103 @@
     });
   }
 
-  function normaliseLists(doc, lists) {
+  var ZERO_MARGIN = /^0(px|pt|cm|mm|in|em|rem)?$/;
+
+  // Paragraphs that show built-in space above or below them: any <p> unless
+  // its margins are set to zero inline or it is one of Word/classic Outlook's
+  // "Mso" paragraphs, which a stylesheet already sets to zero.
+  function isSpacedParagraph(p) {
+    if (p.tagName !== "P" || isEmptyLine(p)) return false;
+    if (/(^|\s)Mso/.test(p.className || "")) return false;
+    var top = p.style.marginTop;
+    var bottom = p.style.marginBottom;
+    return !(top && bottom && ZERO_MARGIN.test(top) && ZERO_MARGIN.test(bottom));
+  }
+
+  function isBlankNode(node) {
+    if (node.nodeType === 3) return node.nodeValue.replace(/[\s ​]/g, "") === "";
+    if (node.nodeType === 8) return true;
+    return node.nodeType === 1 && (isEmptyLine(node) || node.tagName === "BR");
+  }
+
+  // Next (forward) or previous sibling that is not whitespace or a comment.
+  function meaningfulSibling(node, forward) {
+    var n = forward ? node.nextSibling : node.previousSibling;
+    while (n && (n.nodeType === 8 || (n.nodeType === 3 && isBlankNode(n)))) {
+      n = forward ? n.nextSibling : n.previousSibling;
+    }
+    return n;
+  }
+
+  function insertBlankLine(doc, node, after) {
+    node.parentNode.insertBefore(makeBlankLine(doc), after ? node.nextSibling : node);
+  }
+
+  /*
+   * Swap built-in paragraph spacing for real blank lines, so text from Claude
+   * for Outlook, Word or the web spaces out like typed text: no margins, one
+   * blank line between paragraphs. Returns the paragraphs that had spacing.
+   */
+  function normaliseParagraphs(doc, targets, boundary) {
+    var paras = targets.filter(function (el) {
+      return el.tagName === "P" && !el.parentElement.closest("li,td,th");
+    });
+    var spaced = paras.filter(isSpacedParagraph);
+    paras.forEach(function (p) {
+      setStyles(p, { "margin-top": "0", "margin-bottom": "0" });
+    });
+
+    function isPlainLine(n) {
+      return n && n.nodeType === 1 && !isBlankNode(n) && !LIST_TAGS[n.tagName] &&
+        !n.querySelector("ol,ul") && isNewContent(n, boundary);
+    }
+    spaced.forEach(function (p) {
+      if (isPlainLine(meaningfulSibling(p, true))) insertBlankLine(doc, p, true);
+      var prev = meaningfulSibling(p, false);
+      if (isPlainLine(prev) && spaced.indexOf(prev) === -1) insertBlankLine(doc, p, false);
+    });
+    return spaced;
+  }
+
+  // The list itself, or a wrapper div that holds nothing but the list.
+  function listAnchor(list, body) {
+    var anchor = list;
+    while (anchor.parentElement && anchor.parentElement !== body &&
+           anchor.parentElement.tagName === "DIV" &&
+           !meaningfulSibling(anchor, true) && !meaningfulSibling(anchor, false)) {
+      anchor = anchor.parentElement;
+    }
+    return anchor;
+  }
+
+  // Leave exactly one blank line between anchor and the text on one side.
+  function oneBlankLine(doc, anchor, forward, boundary) {
+    var blanks = [];
+    var n = meaningfulSibling(anchor, forward);
+    while (n && isBlankNode(n)) {
+      blanks.push(n);
+      n = meaningfulSibling(n, forward);
+    }
+    // Start or end of the text, the quoted email, or another list: leave it.
+    if (!n || (n.nodeType === 1 && (LIST_TAGS[n.tagName] || !isNewContent(n, boundary)))) return;
+    if (blanks.length === 0) {
+      insertBlankLine(doc, anchor, forward);
+      return;
+    }
+    // blanks[0] sits next to the list; keep it, drop the rest.
+    blanks.slice(1).forEach(function (el) { el.parentNode.removeChild(el); });
+  }
+
+  function normaliseLists(doc, lists, body, boundary) {
     lists.forEach(function (list) {
       // Nested lists keep Outlook's own spacing.
       if (list.parentElement && list.parentElement.tagName === "LI") return;
       setStyles(list, { "margin-top": "0", "margin-bottom": "0" });
 
       // Exactly one blank line before and after the list, like a hand-typed email.
-      var prev = list.previousElementSibling;
-      if (prev && !isBlankLine(prev) && !LIST_TAGS[prev.tagName]) {
-        list.parentNode.insertBefore(makeBlankLine(doc), list);
-      }
-      var next = list.nextElementSibling;
-      if (next && !isBlankLine(next) && !LIST_TAGS[next.tagName]) {
-        list.parentNode.insertBefore(makeBlankLine(doc), next);
-      }
+      var anchor = listAnchor(list, body);
+      oneBlankLine(doc, anchor, false, boundary);
+      oneBlankLine(doc, anchor, true, boundary);
 
       Array.prototype.forEach.call(list.children, function (li) {
         if (li.tagName !== "LI") return;
@@ -188,17 +261,36 @@
     return node;
   }
 
-  function hasContent(node) {
-    if (node.nodeType === 3) return node.nodeValue.replace(/[\s ​]/g, "") !== "";
-    return node.nodeType === 1 && !isEmptyLine(node) && node.tagName !== "BR";
+  // Remove line breaks at the very end of el ("Kind regards,<br><br>"),
+  // looking inside its last child too. Returns how many were removed.
+  function stripTrailingBreaks(el) {
+    var removed = 0;
+    var node = el;
+    while (node && node.nodeType === 1) {
+      var last = node.lastChild;
+      while (last && (last.nodeType === 8 || (last.nodeType === 3 && isBlankNode(last)))) {
+        last = last.previousSibling;
+      }
+      if (!last) break;
+      if (last.nodeType === 1 && last.tagName === "BR") {
+        node.removeChild(last);
+        removed++;
+        continue;
+      }
+      if (last.nodeType !== 1 || /^(IMG|TABLE|HR|OL|UL)$/.test(last.tagName)) break;
+      node = last;
+    }
+    return removed;
   }
 
   /*
-   * Collapse the blank lines at the end of the new text (after the sign-off,
-   * above the signature Exclaimer adds on send or the quoted reply) to one.
-   * It only removes lines, never adds one. Returns the number removed.
+   * Leave exactly one blank line at the end of the new text (after the
+   * sign-off, above the signature Exclaimer adds on send or the quoted
+   * reply), whether the gap came from blank lines, line breaks inside the
+   * last line or paragraph spacing. Text that ends with no gap at all is
+   * left without one.
    */
-  function trimSignOffGap(body, boundary) {
+  function trimSignOffGap(doc, body, boundary, spaced) {
     var container = body;
     var end = null;
     if (boundary) {
@@ -208,7 +300,7 @@
       while (end && end !== boundary) {
         var inner = childContaining(end, boundary);
         var before = inner.previousSibling;
-        while (before && !hasContent(before)) before = before.previousSibling;
+        while (before && isBlankNode(before)) before = before.previousSibling;
         if (!before) break;
         container = end;
         end = inner;
@@ -217,22 +309,20 @@
 
     var blanks = [];
     var node = end ? end.previousSibling : container.lastChild;
-    while (node) {
-      var isBlank =
-        (node.nodeType === 3 && !hasContent(node)) ||
-        node.nodeType === 8 ||
-        (node.nodeType === 1 && (isEmptyLine(node) || node.tagName === "BR"));
-      if (!isBlank) break;
+    while (node && isBlankNode(node)) {
       if (node.nodeType === 1) blanks.push(node);
       node = node.previousSibling;
     }
     // Nothing but blank lines: an empty draft, leave it alone.
-    if (!node || blanks.length < 2) return 0;
+    if (!node) return;
+
+    var breaks = node.nodeType === 1 ? stripTrailingBreaks(node) : 0;
+    // One trailing <br> shows nothing; two or more show a blank line.
+    var hadGap = blanks.length > 0 || breaks >= 2 || spaced.indexOf(node) !== -1;
 
     // blanks runs bottom-up; keep the one directly under the sign-off.
-    var extra = blanks.slice(0, blanks.length - 1);
-    extra.forEach(function (el) { el.parentNode.removeChild(el); });
-    return extra.length;
+    blanks.slice(0, -1).forEach(function (el) { el.parentNode.removeChild(el); });
+    if (blanks.length === 0 && hadGap) insertBlankLine(doc, node, true);
   }
 
   /**
@@ -257,9 +347,10 @@
     );
     targets.forEach(function (el) { houseFont(el, body); });
 
+    var spaced = normaliseParagraphs(doc, targets, boundary);
     var lists = targets.filter(function (el) { return LIST_TAGS[el.tagName]; });
-    normaliseLists(doc, lists);
-    trimSignOffGap(body, boundary);
+    normaliseLists(doc, lists, body, boundary);
+    trimSignOffGap(doc, body, boundary, spaced);
 
     // Keep a full document (with any <head> styles the quoted thread relies
     // on) when Outlook gave us one; otherwise return just the body content.
